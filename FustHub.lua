@@ -1,4 +1,4 @@
--- FustHub - Bow Ballistics Fix
+-- FustHub - Reliable Close-Range ESP + Fitted Boxes + Aim/Bow
 -- Client-side Luau. Single file for Lynx/Delta-compatible executors.
 -- This estimates ballistic trajectories, not game/server hit registration.
 
@@ -17,13 +17,18 @@ local previous = PlayerGui:FindFirstChild("UnifiedAimESP")
 if previous then previous:Destroy() end
 
 local S = {
-    Aim = false, BowAim = false, ESP = false,
+    Aim = false, BowAim = false, ESP = true,
     TargetPlayers = true, TargetNPCs = true,
     FOVVisible = true, FOV = 160,
     Distance = 150, Smooth = 0.5, Prediction = 0,
+    AimLowerPixels = 20, -- regular aim screen-space correction (independent of bow)
     Part = "Head",
     Boxes = true, Names = true, Health = true, Highlight = true,
     ESPDistance = 1500,
+    ESPNPCs = true,
+    ESPCloseAlert = true,
+    ESPCloseRange = 60,
+    ESPBoxScale = 0.95, -- fit the outline to the actual body, not a large fixed billboard
     BowDistance = 350,
     BowSpeed = 300, -- fallback studs/second; actual Fust speed is unknown
     BowGravity = Workspace.Gravity, -- fallback; a custom projectile may differ
@@ -204,6 +209,7 @@ adjust("FOV", "FOV", 30, 500, 10, "%.0f")
 adjust("Distance", "Distance", 20, 500, 10, "%.0f")
 adjust("Smooth", "Smooth", 0.05, 1, 0.05, "%.2f")
 adjust("Prediction", "Prediction", 0, 0.5, 0.025, "%.3f")
+adjust("Aim Lower (px)", "AimLowerPixels", 0, 100, 5, "%.0f")
 toggle("Target Players", "TargetPlayers")
 toggle("Target NPCs", "TargetNPCs")
 
@@ -233,6 +239,10 @@ toggle("ESP Boxes", "Boxes")
 toggle("ESP Names", "Names")
 toggle("ESP Health", "Health")
 toggle("ESP Highlight", "Highlight")
+toggle("ESP NPCs", "ESPNPCs")
+toggle("Close Threat Alert", "ESPCloseAlert")
+adjust("Close Alert Range", "ESPCloseRange", 15, 120, 15, "%.0f")
+adjust("ESP Box Fit", "ESPBoxScale", 0.75, 1.10, 0.05, "%.2f")
 adjust("ESP Distance", "ESPDistance", 50, 1500, 50, "%.0f")
 
 -- Draggable panel
@@ -435,16 +445,53 @@ local function canSee(model, position, camera)
     return hit and hit.Instance:IsDescendantOf(model) or false
 end
 
--- Collect NPCs periodically so we don't scan the entire Workspace every frame.
+-- NPC registry: discover humanoid instances, including rigs inside nested containers.
+-- Player characters are handled by Players:GetPlayers() separately.
 local npcModels, nextNpcScan = {}, 0
+local function playerForAncestor(model)
+    local current = model
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            local player = Players:GetPlayerFromCharacter(current)
+            if player then return player end
+        end
+        current = current.Parent
+    end
+    return nil
+end
+
+local function modelForHumanoid(humanoid)
+    local firstModel = nil
+    local current = humanoid.Parent
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            firstModel = firstModel or current
+            if current:FindFirstChild("HumanoidRootPart")
+                or current:FindFirstChild("UpperTorso")
+                or current:FindFirstChild("Torso")
+                or current:FindFirstChild("Head")
+                or current.PrimaryPart then
+                return current
+            end
+        end
+        current = current.Parent
+    end
+    return firstModel
+end
+
 local function getNPCs()
     if os.clock() >= nextNpcScan then
-        nextNpcScan = os.clock() + 0.8
+        nextNpcScan = os.clock() + 0.85
         npcModels = {}
+        local seen = {}
         for _, obj in ipairs(Workspace:GetDescendants()) do
-            if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid")
-                and not Players:GetPlayerFromCharacter(obj) then
-                table.insert(npcModels,obj)
+            if obj:IsA("Humanoid") and obj.Health > 0 then
+                local model = modelForHumanoid(obj)
+                if model and not seen[model]
+                    and not playerForAncestor(model) then
+                    seen[model] = true
+                    table.insert(npcModels, model)
+                end
             end
         end
     end
@@ -521,76 +568,450 @@ local function selectBowTarget(camera, speed, gravity, inheritance)
     return bestPart,bestModel,bestAim,bestTime,bestPitch
 end
 
--- ESP for players
-local function removeESP(player)
-    local v = visuals[player]
-    if not v then return end
-    if v.Highlight then v.Highlight:Destroy() end
-    if v.Billboard then v.Billboard:Destroy() end
-    visuals[player] = nil
+-- Fitted on-screen ESP (no fixed-size BillboardGui).
+-- Tracks player characters even when Humanoid / Root loads after CharacterAdded.
+-- Also shows nearby Humanoid NPCs if "ESP NPCs" is enabled.
+local BODY_PARTS = {
+    Head = true, HumanoidRootPart = true,
+    Torso = true, UpperTorso = true, LowerTorso = true,
+    ["Left Arm"] = true, ["Right Arm"] = true,
+    ["Left Leg"] = true, ["Right Leg"] = true,
+    LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+    RightUpperArm = true, RightLowerArm = true, RightHand = true,
+    LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+    RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+}
+
+local function getESPRoot(model)
+    local root = model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("UpperTorso")
+        or model:FindFirstChild("Torso")
+        or model:FindFirstChild("Head")
+        or model.PrimaryPart
+        or model:FindFirstChild("HumanoidRootPart", true)
+        or model:FindFirstChild("UpperTorso", true)
+        or model:FindFirstChild("Torso", true)
+        or model:FindFirstChild("Head", true)
+    if root and root:IsA("BasePart") then return root end
+    for _, child in ipairs(model:GetChildren()) do
+        if child:IsA("BasePart") then return child end
+    end
+    return nil
 end
-local function createESP(player)
-    if player == LocalPlayer then return end
-    removeESP(player)
-    local char = player.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not hum or not root then return end
-    local highlight = create("Highlight", {
-        Adornee=char, FillColor=Color3.fromRGB(255,70,80),
-        OutlineColor=Color3.new(1,1,1), FillTransparency=0.75,
-        OutlineTransparency=0,
-        DepthMode=Enum.HighlightDepthMode.AlwaysOnTop, Enabled=false
+
+local function removeESP(model)
+    local visual = visuals[model]
+    if not visual then return end
+    visuals[model] = nil
+    for _, name in ipairs({"Highlight", "Box", "Name", "HPBackground"}) do
+        if visual[name] then pcall(function() visual[name]:Destroy() end) end
+    end
+end
+
+local function ensureESP(model, player)
+    if not running or not model or not model:IsA("Model")
+        or model == LocalPlayer.Character
+        or not model:IsDescendantOf(Workspace) then return end
+
+    local root = getESPRoot(model)
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+        or model:FindFirstChildWhichIsA("Humanoid", true)
+    if not root or (not player and not humanoid) then return end
+    if humanoid and humanoid.Health <= 0 then return end
+
+    local old = visuals[model]
+    if old and old.Root == root and old.Humanoid == humanoid then
+        if player then old.Player = player end
+        return
+    end
+    removeESP(model)
+
+    -- Highlight is a 3D adornment, separate from the 2D fitted outline.
+    local hl = create("Highlight", {
+        Name = "FustHub_ESP_Highlight", Adornee = model,
+        FillColor = Color3.fromRGB(255,70,80),
+        OutlineColor = Color3.fromRGB(255,255,255),
+        FillTransparency = 0.8, OutlineTransparency = 0,
+        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+        Enabled = false
+    }, Workspace)
+
+    local box = create("Frame", {
+        Name = "FustHub_ESP_Box", BackgroundTransparency = 1,
+        BorderSizePixel = 0, Size = UDim2.fromOffset(0,0),
+        Visible = false, ZIndex = 10
     }, gui)
-    local billboard = create("BillboardGui", {
-        Adornee=root, Size=UDim2.fromOffset(120,190),
-        StudsOffset=Vector3.new(0,0.4,0),
-        AlwaysOnTop=true, Enabled=false
-    }, gui)
-    local outline = create("Frame", {
-        Size=UDim2.new(0.82,0,0.82,0),
-        Position=UDim2.new(0.09,0,0.09,0),
-        BackgroundTransparency=1
-    }, billboard)
-    create("UIStroke",{Color=Color3.fromRGB(255,80,90),Thickness=2},outline)
+    create("UIStroke", {
+        Color = Color3.fromRGB(255,85,95), Thickness = 1.5
+    }, box)
+
     local name = create("TextLabel", {
-        Size=UDim2.new(1,30,0,24), Position=UDim2.fromOffset(-15,-26),
-        BackgroundTransparency=1, Text=player.DisplayName,
-        TextColor3=Color3.new(1,1,1), TextStrokeTransparency=0.25,
-        Font=Enum.Font.GothamBold, TextSize=12
-    }, outline)
-    local hpBG = create("Frame", {
-        Size=UDim2.fromOffset(6,155), Position=UDim2.fromOffset(-12,0),
-        BackgroundColor3=Color3.fromRGB(35,35,35), BorderSizePixel=0
-    }, outline)
-    local hpBar = create("Frame", {
-        AnchorPoint=Vector2.new(0,1), Position=UDim2.fromScale(0,1),
-        Size=UDim2.fromScale(1,1),
-        BackgroundColor3=Color3.fromRGB(50,255,80), BorderSizePixel=0
-    }, hpBG)
-    visuals[player] = {
-        Character=char, Root=root, Humanoid=hum,
-        Highlight=highlight, Billboard=billboard, Box=outline,
-        Name=name, HPBackground=hpBG, HPBar=hpBar
+        Name = "FustHub_ESP_Name", BackgroundTransparency = 1,
+        Text = (player and player.DisplayName or model.Name),
+        TextColor3 = Color3.new(1,1,1),
+        TextStrokeTransparency = 0.3,
+        Font = Enum.Font.GothamBold, TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Size = UDim2.fromOffset(120,18), Visible = false,
+        ZIndex = 11
+    }, gui)
+
+    local hpBg = create("Frame", {
+        Name = "FustHub_ESP_HP", BackgroundColor3 = Color3.fromRGB(30,30,30),
+        BorderSizePixel = 0, Size = UDim2.fromOffset(4,0),
+        Visible = false, ZIndex = 11
+    }, gui)
+    local hpFill = create("Frame", {
+        AnchorPoint = Vector2.new(0,1),
+        Position = UDim2.fromScale(0,1),
+        Size = UDim2.fromScale(1,1),
+        BackgroundColor3 = Color3.fromRGB(70,255,70),
+        BorderSizePixel = 0, ZIndex = 12
+    }, hpBg)
+
+    visuals[model] = {
+        Character = model, Root = root, Humanoid = humanoid,
+        Player = player, Highlight = hl, Box = box, Name = name,
+        HPBackground = hpBg, HPBar = hpFill,
+        NextBoxUpdate = 0,
+        OnScreen = false
     }
 end
+
+-- A world-space model box may include giant equipped weapons/accessories.
+-- Instead measure only actual R6/R15 body parts and project their corners.
+-- This makes the outline shrink naturally with distance and fit the player.
+local function fittedBox(model, root, camera)
+    local xMin, yMin = math.huge, math.huge
+    local xMax, yMax = -math.huge, -math.huge
+    local bodyCount, points = 0, 0
+
+    local function addPart(cframe, size)
+        local half = size * 0.5
+        for sx = -1, 1, 2 do
+            for sy = -1, 1, 2 do
+                for sz = -1, 1, 2 do
+                    local world = cframe:PointToWorldSpace(Vector3.new(
+                        half.X*sx, half.Y*sy, half.Z*sz))
+                    local p = camera:WorldToViewportPoint(world)
+                    if p.Z > 0.15 then
+                        points = points + 1
+                        xMin = math.min(xMin,p.X)
+                        yMin = math.min(yMin,p.Y)
+                        xMax = math.max(xMax,p.X)
+                        yMax = math.max(yMax,p.Y)
+                    end
+                end
+            end
+        end
+    end
+
+    for _, child in ipairs(model:GetChildren()) do
+        if child:IsA("BasePart") and BODY_PARTS[child.Name] then
+            addPart(child.CFrame, child.Size)
+            bodyCount = bodyCount + 1
+        end
+    end
+
+    -- Nonstandard character rigs: estimate human proportions around root.
+    if bodyCount < 2 then
+        xMin,yMin,xMax,yMax,points = math.huge,math.huge,-math.huge,-math.huge,0
+        local head = model:FindFirstChild("Head")
+        local height = 5.5
+        if head and head:IsA("BasePart") then
+            height = math.clamp(math.abs(head.Position.Y-root.Position.Y)*2.4+2,4,10)
+        end
+        addPart(CFrame.new(root.Position + Vector3.new(0,0.25,0)),
+            Vector3.new(2.4,height,1.6))
+    end
+
+    local view = camera.ViewportSize
+    if points == 0 then
+        -- If the camera is inside an enemy rig, its body corners can all
+        -- be behind the near clipping plane. Fall back to a root projection.
+        local p = camera:WorldToViewportPoint(root.Position)
+        if p.Z <= 0.1 then return nil end
+        local d = math.max((root.Position - camera.CFrame.Position).Magnitude,1)
+        local approximateHeight = math.clamp(view.Y * 5.5 / d, 24, view.Y * 2)
+        local approximateWidth = approximateHeight * 0.45
+        xMin, xMax = p.X - approximateWidth/2, p.X + approximateWidth/2
+        yMin, yMax = p.Y - approximateHeight/2, p.Y + approximateHeight/2
+    end
+
+    -- Clamp huge near-camera projections instead of rejecting them entirely.
+    -- This is important when an enemy is just a few studs away.
+    local left = math.clamp(xMin, 0, view.X)
+    local right = math.clamp(xMax, 0, view.X)
+    local top = math.clamp(yMin, 0, view.Y)
+    local bottom = math.clamp(yMax, 0, view.Y)
+    if right - left < 2 or bottom - top < 2 then return nil end
+
+    local scale = math.clamp(S.ESPBoxScale, 0.75, 1.1)
+    local bw, bh = (right-left)*scale, (bottom-top)*scale
+    local centerX, centerY = (left+right)*0.5, (top+bottom)*0.5
+    return centerX-bw*0.5, centerY-bh*0.5, bw, bh
+end
+
+local function hideESP(v)
+    v.Box.Visible = false
+    v.Name.Visible = false
+    v.HPBackground.Visible = false
+    v.Highlight.Enabled = false
+    v.OnScreen = false
+end
+
+local function renderESP(v, camera, now)
+    local model = v.Character
+    local root = v.Root
+    if not model:IsDescendantOf(Workspace) or not root:IsDescendantOf(model)
+        or (v.Humanoid and v.Humanoid.Health <= 0)
+        or (v.Player and v.Player.Character ~= model) then
+        hideESP(v)
+        return
+    end
+
+    local isNPC = v.Player == nil
+    local distance = (camera.CFrame.Position-root.Position).Magnitude
+    if not S.ESP or (isNPC and not S.ESPNPCs)
+        or distance > S.ESPDistance then
+        hideESP(v)
+        return
+    end
+
+    v.Highlight.Enabled = S.Highlight
+
+    -- Update near-character boxes 20 times/s; distant boxes 10 times/s.
+    if now < v.NextBoxUpdate then return end
+    v.NextBoxUpdate = now + (distance > 400 and 0.1 or 0.05)
+
+    local x,y,w,h = fittedBox(model,root,camera)
+    if not x then
+        v.Box.Visible = false
+        v.Name.Visible = false
+        v.HPBackground.Visible = false
+        v.OnScreen = false
+        return
+    end
+    v.OnScreen = true
+    v.Box.Position = UDim2.fromOffset(math.floor(x),math.floor(y))
+    v.Box.Size = UDim2.fromOffset(math.ceil(w),math.ceil(h))
+    v.Box.Visible = S.Boxes
+
+    local maxHealth = v.Humanoid and math.max(v.Humanoid.MaxHealth,1) or 100
+    local health = v.Humanoid and v.Humanoid.Health or maxHealth
+    local hpRatio = math.clamp(health/maxHealth,0,1)
+
+    v.Name.Visible = S.Names and h > 12
+    if v.Name.Visible then
+        local labelW = math.clamp(w + 30, 70, 155)
+        v.Name.Size = UDim2.fromOffset(labelW,18)
+        v.Name.Position = UDim2.fromOffset(
+            math.floor(x+w/2-labelW/2),math.floor(y-20))
+        local displayName = v.Player and v.Player.DisplayName or model.Name
+        v.Name.Text = displayName .. (v.Humanoid and
+            " [" .. math.ceil(health) .. " HP]" or "")
+    end
+
+    v.HPBackground.Visible = S.Health and h > 8
+    if v.HPBackground.Visible then
+        v.HPBackground.Position = UDim2.fromOffset(
+            math.floor(x-8),math.floor(y))
+        v.HPBackground.Size = UDim2.fromOffset(4,math.ceil(h))
+        v.HPBar.Size = UDim2.fromScale(1,hpRatio)
+        v.HPBar.BackgroundColor3 = Color3.fromRGB(
+            math.floor(255*(1-hpRatio)),math.floor(255*hpRatio),40)
+    end
+end
+
 local function setupPlayer(player)
     if player == LocalPlayer then return end
-    connect(player.CharacterAdded,function(char)
+    connect(player.CharacterAdded, function(model)
+        -- CharacterAdded fires before Humanoid/parts may replicate.
         task.defer(function()
-            local hum = char:WaitForChild("Humanoid",10)
-            local root = char:WaitForChild("HumanoidRootPart",10)
-            if running and hum and root then createESP(player) end
+            if running then ensureESP(model,player) end
         end)
     end)
-    if player.Character then createESP(player) end
+    connect(player.CharacterRemoving, function(model)
+        removeESP(model)
+    end)
+    if player.Character then ensureESP(player.Character,player) end
 end
+
 for _, player in ipairs(Players:GetPlayers()) do setupPlayer(player) end
 connect(Players.PlayerAdded,setupPlayer)
-connect(Players.PlayerRemoving,removeESP)
+connect(Players.PlayerRemoving,function(player)
+    for model,v in pairs(visuals) do
+        if v.Player == player then removeESP(model) end
+    end
+end)
+
+-- Very close enemies may have their entire rig outside the camera view.
+-- Spatial discovery provides a second detection path for those humanoids.
+local nearbyParams = OverlapParams.new()
+nearbyParams.FilterType = Enum.RaycastFilterType.Exclude
+nearbyParams.MaxParts = 0
+local nextNearbyScan = 0
+local function refreshNearby(now)
+    if not S.ESP or now < nextNearbyScan then return end
+    nextNearbyScan = now + 0.25
+    local character = LocalPlayer.Character
+    local myRoot = character and (character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("Head"))
+    if not myRoot then return end
+    nearbyParams.FilterDescendantsInstances = {character}
+    local success, nearbyParts = pcall(function()
+        return Workspace:GetPartBoundsInRadius(
+            myRoot.Position, math.max(S.ESPCloseRange, 60), nearbyParams)
+    end)
+    if not success then return end
+
+    local seen = {}
+    for _, part in ipairs(nearbyParts) do
+        local ancestor = part.Parent
+        while ancestor and ancestor ~= Workspace do
+            if ancestor:IsA("Model") then
+                local hum = ancestor:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then
+                    if not seen[ancestor] and ancestor ~= character then
+                        seen[ancestor] = true
+                        local owner = playerForAncestor(ancestor)
+                        if owner ~= LocalPlayer and
+                            (owner ~= nil or S.ESPNPCs) then
+                            ensureESP(ancestor, owner)
+                        end
+                    end
+                    break
+                end
+            end
+            ancestor = ancestor.Parent
+        end
+    end
+end
+
+local nextESPPlayerScan, nextESPNPCScan = 0, 0
+local function refreshESP(now)
+    if not S.ESP then return end
+
+    if now >= nextESPPlayerScan then
+        nextESPPlayerScan = now + 0.20
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character then
+                ensureESP(player.Character, player)
+            end
+        end
+    end
+
+    if S.ESPNPCs and now >= nextESPNPCScan then
+        nextESPNPCScan = now + 0.85
+        for _, model in ipairs(getNPCs()) do
+            if model:IsDescendantOf(Workspace)
+                and not playerForAncestor(model) then
+                ensureESP(model, nil)
+            end
+        end
+    end
+
+    refreshNearby(now)
+
+    for model, v in pairs(visuals) do
+        if not model:IsDescendantOf(Workspace)
+            or (v.Player and v.Player.Character ~= model) then
+            removeESP(model)
+        end
+    end
+end
+
+-- Listen for humanoids *and* late-arriving body parts. If a Humanoid
+-- replicates before its root, the root event gives it another chance.
+connect(Workspace.DescendantAdded, function(obj)
+    if not running or not S.ESP then return end
+    if not (obj:IsA("Humanoid") or
+        (obj:IsA("BasePart") and
+        (obj.Name == "HumanoidRootPart" or obj.Name == "Head"
+        or obj.Name == "UpperTorso" or obj.Name == "Torso"))) then
+        return
+    end
+    task.defer(function()
+        if not running or not obj:IsDescendantOf(Workspace) then return end
+        local current = obj.Parent
+        while current and current ~= Workspace do
+            if current:IsA("Model") then
+                local owner = playerForAncestor(current)
+                if owner == LocalPlayer then return end
+                local hum = current:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then
+                    if owner or S.ESPNPCs then
+                        ensureESP(current, owner)
+                    end
+                    return
+                end
+            end
+            current = current.Parent
+        end
+    end)
+end)
+
+-- This warning remains visible even when a nearby enemy is behind the camera
+-- or too close for a valid projected bounding box.
+local nearAlert = create("TextLabel", {
+    Name = "FustHubCloseThreat", AnchorPoint = Vector2.new(0.5,0),
+    Position = UDim2.new(0.5,0,0,65), Size = UDim2.fromOffset(350,39),
+    BackgroundColor3 = Color3.fromRGB(85,25,30),
+    BackgroundTransparency = 0.17, BorderSizePixel = 0,
+    TextColor3 = Color3.new(1,1,1), Font = Enum.Font.GothamBold,
+    TextSize = 12, TextWrapped = true, Visible = false, ZIndex = 30
+}, gui)
+round(nearAlert, 7)
+
+local espStatus = create("TextLabel", {
+    Name = "ESPStatus", Size = UDim2.new(1,-6,0,30),
+    BackgroundTransparency = 1, Text = "ESP scan: initializing...",
+    TextWrapped = true, Font = Enum.Font.Gotham,
+    TextSize = 10, TextColor3 = Color3.fromRGB(180,205,230)
+}, scroll)
+
+local nextThreatUpdate = 0
+local function updateThreats(now, camera)
+    if now < nextThreatUpdate then return end
+    nextThreatUpdate = now + 0.25
+    local myCharacter = LocalPlayer.Character
+    local myRoot = myCharacter and (myCharacter:FindFirstChild("HumanoidRootPart")
+        or myCharacter:FindFirstChild("Head"))
+    local threats = {}
+    local playerCount, npcCount = 0, 0
+    if S.ESP then
+        for model, v in pairs(visuals) do
+            if model:IsDescendantOf(Workspace) and v.Root.Parent
+                and (not v.Humanoid or v.Humanoid.Health > 0) then
+                if v.Player then playerCount = playerCount + 1
+                else npcCount = npcCount + 1 end
+                if myRoot then
+                    local d = (v.Root.Position - myRoot.Position).Magnitude
+                    if d <= S.ESPCloseRange then
+                        local name = v.Player and v.Player.DisplayName or model.Name
+                        table.insert(threats, {distance=d,name=name})
+                    end
+                end
+            end
+        end
+    end
+    table.sort(threats, function(a,b) return a.distance < b.distance end)
+    espStatus.Text = string.format("ESP tracked: %d players | %d NPCs | %d close",
+        playerCount, npcCount, #threats)
+    nearAlert.Visible = S.ESP and S.ESPCloseAlert and #threats > 0
+    if nearAlert.Visible then
+        local entries = {}
+        for i = 1, math.min(#threats, 3) do
+            local t = threats[i]
+            table.insert(entries, string.format("%s (%.0f studs)", t.name, t.distance))
+        end
+        nearAlert.Text = "NEARBY: " .. table.concat(entries, " | ")
+            .. (#threats > 3 and " | +more" or "")
+    end
+end
 
 local lastStatusUpdate = 0
+local lastESPWarn = 0
 RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,function(dt)
     if not running then return end
     local camera = Workspace.CurrentCamera
@@ -601,25 +1022,26 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,functi
     circle.Size=UDim2.fromOffset(S.FOV*2,S.FOV*2)
     circle.Visible=S.FOVVisible
 
-    for player, v in pairs(visuals) do
-        local alive = v.Character.Parent ~= nil and
-            v.Root.Parent ~= nil and v.Humanoid.Health > 0
-        local distance = alive and
-            (camera.CFrame.Position-v.Root.Position).Magnitude or math.huge
-        local show = S.ESP and alive and distance <= S.ESPDistance
-        v.Billboard.Enabled=show
-        v.Highlight.Enabled=show and S.Highlight
-        v.Box.Visible=S.Boxes
-        v.Name.Visible=S.Names
-        v.HPBackground.Visible=S.Health
-        if show then
-            local hp = math.clamp(v.Humanoid.Health/math.max(v.Humanoid.MaxHealth,1),0,1)
-            v.HPBar.Size=UDim2.fromScale(1,hp)
-            v.HPBar.BackgroundColor3=Color3.fromRGB(
-                math.floor(255*(1-hp)),math.floor(255*hp),50)
-            v.Name.Text=player.DisplayName .. " [" .. math.ceil(v.Humanoid.Health) .. " HP]"
+    local now = os.clock()
+    local refreshOkay, refreshError = pcall(refreshESP, now)
+    if not refreshOkay then
+        if now - lastESPWarn > 2 then
+            lastESPWarn = now
+            warn("[FustHub ESP] Detection error:", refreshError)
         end
     end
+    for _, visual in pairs(visuals) do
+        -- One bad/nonstandard rig must never break ESP for every other rig.
+        local ok, err = pcall(renderESP, visual, camera, now)
+        if not ok then
+            hideESP(visual)
+            if not visual.Warned then
+                visual.Warned = true
+                warn("[FustHub ESP] Rig render error:", err)
+            end
+        end
+    end
+    updateThreats(now, camera)
 
     local aimPosition, smooth
     if S.BowAim then
@@ -640,10 +1062,28 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,functi
     elseif S.Aim then
         local part,model=selectAimTarget(camera,S.Distance,S.Part)
         if part then
-            local root=model:FindFirstChild("HumanoidRootPart")
-            local velocity=root and root.AssemblyLinearVelocity or Vector3.zero
-            aimPosition=part.Position + velocity*S.Prediction
-            smooth=S.Smooth
+            local root = model:FindFirstChild("HumanoidRootPart")
+            local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
+
+            -- Regular aim tracks the head/body's actual vertical position.
+            -- Only predict *horizontal* movement: leading velocity.Y was
+            -- pulling the camera above jumping/rising players.
+            local horizontalLead = Vector3.new(velocity.X, 0, velocity.Z)
+                * math.clamp(S.Prediction, 0, 0.5)
+            local predicted = part.Position + horizontalLead
+
+            -- Fust can show a reticle displaced from the camera center.
+            -- Apply a bounded camera-relative DOWN adjustment in pixels,
+            -- so it stays consistent at short and long distance.
+            local distance = math.max((predicted - camera.CFrame.Position).Magnitude, 1)
+            local height = math.max(camera.ViewportSize.Y, 1)
+            local unitsPerPixel = (2 * distance
+                * math.tan(math.rad(camera.FieldOfView * 0.5))) / height
+            local lowerBy = math.clamp(S.AimLowerPixels, 0, 100)
+                * unitsPerPixel
+
+            aimPosition = predicted - camera.CFrame.UpVector * lowerBy
+            smooth = S.Smooth
         end
     end
 
@@ -657,7 +1097,7 @@ _G.UnifiedAimCleanup=function()
     running=false
     pcall(function() RunService:UnbindFromRenderStep(renderName) end)
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
-    for player in pairs(visuals) do removeESP(player) end
+    for model in pairs(visuals) do removeESP(model) end
     if gui then gui:Destroy() end
 end
-print("[FustHub] Bow ballistic fix loaded")
+print("[FustHub] Reliable close-range ESP + Aim/Bow loaded")
