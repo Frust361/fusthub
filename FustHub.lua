@@ -1,4 +1,4 @@
--- FustHub - Reliable Close-Range ESP + Fitted Boxes + Aim/Bow
+-- FustHub - Precision Head Lock + Reliable ESP + Bow
 -- Client-side Luau. Single file for Lynx/Delta-compatible executors.
 -- This estimates ballistic trajectories, not game/server hit registration.
 
@@ -21,7 +21,7 @@ local S = {
     TargetPlayers = true, TargetNPCs = true,
     FOVVisible = true, FOV = 160,
     Distance = 150, Smooth = 0.5, Prediction = 0,
-    AimLowerPixels = 20, -- regular aim screen-space correction (independent of bow)
+    HeadPrecision = true, -- exact camera-to-head alignment in normal Aim mode
     Part = "Head",
     Boxes = true, Names = true, Health = true, Highlight = true,
     ESPDistance = 1500,
@@ -209,7 +209,7 @@ adjust("FOV", "FOV", 30, 500, 10, "%.0f")
 adjust("Distance", "Distance", 20, 500, 10, "%.0f")
 adjust("Smooth", "Smooth", 0.05, 1, 0.05, "%.2f")
 adjust("Prediction", "Prediction", 0, 0.5, 0.025, "%.3f")
-adjust("Aim Lower (px)", "AimLowerPixels", 0, 100, 5, "%.0f")
+toggle("Precise Head Lock", "HeadPrecision")
 toggle("Target Players", "TargetPlayers")
 toggle("Target NPCs", "TargetNPCs")
 
@@ -1060,30 +1060,25 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,functi
                 speed,gravity,fromTool and "(tool)" or "(fallback)")
         end
     elseif S.Aim then
-        local part,model=selectAimTarget(camera,S.Distance,S.Part)
+        -- Normal Aim and Bow Aim are intentionally independent.
+        -- Head mode aims at the ACTUAL Head part center.
+        -- Never apply the previous pixel-down correction or world-space
+        -- lead: both moved the crosshair away from the visible head.
+        local part, model = selectAimTarget(camera, S.Distance, S.Part)
         if part then
-            local root = model:FindFirstChild("HumanoidRootPart")
-            local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
-
-            -- Regular aim tracks the head/body's actual vertical position.
-            -- Only predict *horizontal* movement: leading velocity.Y was
-            -- pulling the camera above jumping/rising players.
-            local horizontalLead = Vector3.new(velocity.X, 0, velocity.Z)
-                * math.clamp(S.Prediction, 0, 0.5)
-            local predicted = part.Position + horizontalLead
-
-            -- Fust can show a reticle displaced from the camera center.
-            -- Apply a bounded camera-relative DOWN adjustment in pixels,
-            -- so it stays consistent at short and long distance.
-            local distance = math.max((predicted - camera.CFrame.Position).Magnitude, 1)
-            local height = math.max(camera.ViewportSize.Y, 1)
-            local unitsPerPixel = (2 * distance
-                * math.tan(math.rad(camera.FieldOfView * 0.5))) / height
-            local lowerBy = math.clamp(S.AimLowerPixels, 0, 100)
-                * unitsPerPixel
-
-            aimPosition = predicted - camera.CFrame.UpVector * lowerBy
-            smooth = S.Smooth
+            if S.Part == "Head" then
+                aimPosition = part.Position
+                -- Instant alignment prevents smoothing lag at long range.
+                smooth = S.HeadPrecision and 1 or S.Smooth
+            else
+                -- Optional body mode retains horizontal movement prediction.
+                local root = model:FindFirstChild("HumanoidRootPart")
+                local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
+                local horizontalLead = Vector3.new(velocity.X, 0, velocity.Z)
+                    * math.clamp(S.Prediction, 0, 0.5)
+                aimPosition = part.Position + horizontalLead
+                smooth = S.Smooth
+            end
         end
     end
 
@@ -1100,4 +1095,4 @@ _G.UnifiedAimCleanup=function()
     for model in pairs(visuals) do removeESP(model) end
     if gui then gui:Destroy() end
 end
-print("[FustHub] Reliable close-range ESP + Aim/Bow loaded")
+print("[FustHub] Precision head lock + Reliable ESP + Bow loaded")
