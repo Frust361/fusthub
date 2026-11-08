@@ -1,11 +1,13 @@
--- FustHub - Precision Head Lock + Reliable ESP + Bow
+-- FustHub - Recoil Head Lock + Fullbright + Reliable ESP + Bow
 -- Client-side Luau. Single file for Lynx/Delta-compatible executors.
--- This estimates ballistic trajectories, not game/server hit registration.
+-- Client camera correction cannot guarantee the game/server bullet direction.
+-- Bow ballistics are estimates, not game/server hit registration.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
@@ -22,6 +24,8 @@ local S = {
     FOVVisible = true, FOV = 160,
     Distance = 150, Smooth = 0.5, Prediction = 0,
     HeadPrecision = true, -- exact camera-to-head alignment in normal Aim mode
+    RecoilHeadLock = true, -- keep the same visible head through recoil kicks
+    Fullbright = false, -- locally force daytime lighting while enabled
     Part = "Head",
     Boxes = true, Names = true, Health = true, Highlight = true,
     ESPDistance = 1500,
@@ -42,6 +46,103 @@ local connections = {}
 local visuals = {}
 local running = true
 local renderName = "UnifiedAimRender"
+
+-- Lighting is captured only when Fullbright is switched ON, then restored
+-- when switched OFF, when re-executing or when the GUI is cleaned up.
+local lightingBefore = nil
+local effectsBefore = nil
+local lightingProperties = {
+    "ClockTime", "Brightness", "Ambient", "OutdoorAmbient",
+    "ExposureCompensation", "GlobalShadows", "FogStart", "FogEnd",
+    "ColorShift_Top", "ColorShift_Bottom"
+}
+
+local function captureLighting()
+    lightingBefore = {}
+    effectsBefore = {}
+    for _, name in ipairs(lightingProperties) do
+        local ok, value = pcall(function() return Lighting[name] end)
+        if ok then lightingBefore[name] = value end
+    end
+    for _, obj in ipairs(Lighting:GetDescendants()) do
+        if obj:IsA("ColorCorrectionEffect") then
+            effectsBefore[obj] = {Enabled = obj.Enabled}
+        elseif obj:IsA("Atmosphere") then
+            effectsBefore[obj] = {
+                Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare
+            }
+        end
+    end
+end
+
+local function applyFullbright()
+    if not S.Fullbright then return end
+    local overrides = {
+        ClockTime = 13,
+        Brightness = 3.5,
+        Ambient = Color3.fromRGB(255, 255, 255),
+        OutdoorAmbient = Color3.fromRGB(255, 255, 255),
+        ExposureCompensation = 0.35,
+        GlobalShadows = false,
+        FogStart = 0,
+        FogEnd = 1000000,
+        ColorShift_Top = Color3.new(0, 0, 0),
+        ColorShift_Bottom = Color3.new(0, 0, 0)
+    }
+    for name, value in pairs(overrides) do
+        pcall(function()
+            if Lighting[name] ~= value then Lighting[name] = value end
+        end)
+    end
+    for _, obj in ipairs(Lighting:GetDescendants()) do
+        if obj:IsA("ColorCorrectionEffect") then
+            -- Some experiences darken nights with a color filter.
+            if effectsBefore and not effectsBefore[obj] then
+                effectsBefore[obj] = {Enabled = obj.Enabled}
+            end
+            if obj.Enabled then pcall(function() obj.Enabled = false end) end
+        elseif obj:IsA("Atmosphere") then
+            if effectsBefore and not effectsBefore[obj] then
+                effectsBefore[obj] = {
+                    Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare
+                }
+            end
+            pcall(function()
+                obj.Density = 0
+                obj.Haze = 0
+                obj.Glare = 0
+            end)
+        end
+    end
+end
+
+local function restoreLighting()
+    if lightingBefore then
+        for name, value in pairs(lightingBefore) do
+            pcall(function() Lighting[name] = value end)
+        end
+    end
+    if effectsBefore then
+        for obj, props in pairs(effectsBefore) do
+            if obj and obj.Parent then
+                for name, value in pairs(props) do
+                    pcall(function() obj[name] = value end)
+                end
+            end
+        end
+    end
+    lightingBefore, effectsBefore = nil, nil
+end
+
+local function setFullbright(enabled)
+    S.Fullbright = enabled
+    if enabled then
+        if not lightingBefore then captureLighting() end
+        applyFullbright()
+    else
+        restoreLighting()
+    end
+end
 
 local function connect(signal, fn)
     local c = signal:Connect(fn)
@@ -161,6 +262,7 @@ local function toggle(label, key)
         S[key] = not S[key]
         update()
         if key == "BowAim" then refreshBowUI() end
+        if key == "Fullbright" then setFullbright(S.Fullbright) end
     end)
     update()
     return update
@@ -210,6 +312,8 @@ adjust("Distance", "Distance", 20, 500, 10, "%.0f")
 adjust("Smooth", "Smooth", 0.05, 1, 0.05, "%.2f")
 adjust("Prediction", "Prediction", 0, 0.5, 0.025, "%.3f")
 toggle("Precise Head Lock", "HeadPrecision")
+toggle("Anti-Recoil Head Magnet", "RecoilHeadLock")
+toggle("Fullbright (Day Vision)", "Fullbright")
 toggle("Target Players", "TargetPlayers")
 toggle("Target NPCs", "TargetNPCs")
 
@@ -529,6 +633,37 @@ local function selectAimTarget(camera, maxDistance, partName)
         end
     end)
     return bestPart,bestModel
+end
+
+-- Normal aim stays attached to the SAME head even if recoil temporarily
+-- pushes it outside the FOV circle. Acquisition still requires FOV + visibility.
+-- The lock releases when the target dies, becomes obstructed or leaves range.
+local lockedHeadModel = nil
+local lockedHeadPart = nil
+
+local function clearHeadLock()
+    lockedHeadModel, lockedHeadPart = nil, nil
+end
+
+local function getStickyHead(camera)
+    if lockedHeadModel and lockedHeadPart then
+        local model, head = lockedHeadModel, lockedHeadPart
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        local owner = playerForAncestor(model)
+        local enabled = owner and (owner ~= LocalPlayer and S.TargetPlayers)
+            or (not owner and S.TargetNPCs)
+        local valid = model:IsDescendantOf(Workspace)
+            and head:IsDescendantOf(model)
+            and humanoid and humanoid.Health > 0
+            and enabled
+            and (head.Position - camera.CFrame.Position).Magnitude <= S.Distance
+            and canSee(model, head.Position, camera)
+        if valid then return head, model end
+        clearHeadLock()
+    end
+    local part, model = selectAimTarget(camera, S.Distance, "Head")
+    if part then lockedHeadPart, lockedHeadModel = part, model end
+    return part, model
 end
 
 local function selectBowTarget(camera, speed, gravity, inheritance)
@@ -1012,7 +1147,11 @@ end
 
 local lastStatusUpdate = 0
 local lastESPWarn = 0
-RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,function(dt)
+local nextFullbrightUpdate = 0
+-- Run as late as possible in the camera pipeline. A recoil script may tilt
+-- the camera after the standard camera update; late head correction reduces
+-- the visible recoil kick. It cannot rewrite server-side shooting mechanics.
+RunService:BindToRenderStep(renderName,Enum.RenderPriority.Last.Value + 10,function(dt)
     if not running then return end
     local camera = Workspace.CurrentCamera
     if not camera then return end
@@ -1023,6 +1162,10 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,functi
     circle.Visible=S.FOVVisible
 
     local now = os.clock()
+    if S.Fullbright and now >= nextFullbrightUpdate then
+        nextFullbrightUpdate = now + 0.15
+        applyFullbright()
+    end
     local refreshOkay, refreshError = pcall(refreshESP, now)
     if not refreshOkay then
         if now - lastESPWarn > 2 then
@@ -1044,6 +1187,10 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,functi
     updateThreats(now, camera)
 
     local aimPosition, smooth
+    if not S.Aim or S.BowAim or S.Part ~= "Head"
+        or not S.RecoilHeadLock then
+        clearHeadLock()
+    end
     if S.BowAim then
         local speed, gravity, inheritance, fromTool = bowStats()
         local part, model, aim, travel, pitch = selectBowTarget(
@@ -1064,12 +1211,18 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,functi
         -- Head mode aims at the ACTUAL Head part center.
         -- Never apply the previous pixel-down correction or world-space
         -- lead: both moved the crosshair away from the visible head.
-        local part, model = selectAimTarget(camera, S.Distance, S.Part)
+        local part, model
+        if S.Part == "Head" and S.RecoilHeadLock then
+            part, model = getStickyHead(camera)
+        else
+            part, model = selectAimTarget(camera, S.Distance, S.Part)
+        end
         if part then
             if S.Part == "Head" then
                 aimPosition = part.Position
-                -- Instant alignment prevents smoothing lag at long range.
-                smooth = S.HeadPrecision and 1 or S.Smooth
+                -- Correct to the ACTUAL head every rendered frame, including
+                -- after recoil raises the view. Never lead above/below head.
+                smooth = (S.HeadPrecision or S.RecoilHeadLock) and 1 or S.Smooth
             else
                 -- Optional body mode retains horizontal movement prediction.
                 local root = model:FindFirstChild("HumanoidRootPart")
@@ -1090,9 +1243,12 @@ end)
 
 _G.UnifiedAimCleanup=function()
     running=false
+    clearHeadLock()
+    S.Fullbright = false
+    restoreLighting()
     pcall(function() RunService:UnbindFromRenderStep(renderName) end)
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     for model in pairs(visuals) do removeESP(model) end
     if gui then gui:Destroy() end
 end
-print("[FustHub] Precision head lock + Reliable ESP + Bow loaded")
+print("[FustHub] Recoil head magnet + Fullbright + Reliable ESP + Bow loaded")
