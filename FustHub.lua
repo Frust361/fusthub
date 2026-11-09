@@ -47,76 +47,127 @@ local visuals = {}
 local running = true
 local renderName = "UnifiedAimRender"
 
--- Lighting is captured only when Fullbright is switched ON, then restored
--- when switched OFF, when re-executing or when the GUI is cleaned up.
+-- STABLE FULLBRIGHT: watch Lighting writes rather than fighting them
+-- on a 0.15-second interval. The game may update nighttime settings every
+-- frame; change signals restore the desired values immediately. A late
+-- render-frame check is a fallback for properties updated by other scripts.
 local lightingBefore = nil
 local effectsBefore = nil
-local lightingProperties = {
-    "ClockTime", "Brightness", "Ambient", "OutdoorAmbient",
-    "ExposureCompensation", "GlobalShadows", "FogStart", "FogEnd",
-    "ColorShift_Top", "ColorShift_Bottom"
+local fullbrightConnections = {}
+local trackedEffects = {}
+local fullbrightWriting = false
+
+local lightingOverrides = {
+    ClockTime = 13,
+    Brightness = 3.5,
+    Ambient = Color3.fromRGB(255, 255, 255),
+    OutdoorAmbient = Color3.fromRGB(255, 255, 255),
+    ExposureCompensation = 0.35,
+    GlobalShadows = false,
+    FogStart = 0,
+    FogEnd = 1000000,
+    ColorShift_Top = Color3.new(0, 0, 0),
+    ColorShift_Bottom = Color3.new(0, 0, 0)
 }
+
+local effectOverrides = {
+    ColorCorrectionEffect = {Enabled = false},
+    Atmosphere = {Density = 0, Haze = 0, Glare = 0}
+}
+
+local function disconnectFullbrightSignals()
+    for _, c in ipairs(fullbrightConnections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(fullbrightConnections)
+    table.clear(trackedEffects)
+end
+
+local function setPropertyIfNeeded(obj, name, desired)
+    pcall(function()
+        if obj[name] ~= desired then
+            obj[name] = desired
+        end
+    end)
+end
+
+local function enforceLightingProperty(name)
+    if not S.Fullbright or not running or fullbrightWriting then return end
+    fullbrightWriting = true
+    setPropertyIfNeeded(Lighting, name, lightingOverrides[name])
+    fullbrightWriting = false
+end
+
+local function enforceEffect(obj)
+    if not S.Fullbright or not running or fullbrightWriting or not obj.Parent then
+        return
+    end
+    local props = effectOverrides[obj.ClassName]
+    if not props then return end
+    fullbrightWriting = true
+    for property, value in pairs(props) do
+        setPropertyIfNeeded(obj, property, value)
+    end
+    fullbrightWriting = false
+end
+
+local function trackEffect(obj)
+    local props = effectOverrides[obj.ClassName]
+    if not props or trackedEffects[obj] then return end
+    trackedEffects[obj] = true
+    if effectsBefore and not effectsBefore[obj] then
+        local snapshot = {}
+        for name in pairs(props) do
+            local ok, value = pcall(function() return obj[name] end)
+            if ok then snapshot[name] = value end
+        end
+        effectsBefore[obj] = snapshot
+    end
+    for name in pairs(props) do
+        local ok, signal = pcall(function()
+            return obj:GetPropertyChangedSignal(name)
+        end)
+        if ok then
+            table.insert(fullbrightConnections, signal:Connect(function()
+                enforceEffect(obj)
+            end))
+        end
+    end
+    enforceEffect(obj)
+end
 
 local function captureLighting()
     lightingBefore = {}
     effectsBefore = {}
-    for _, name in ipairs(lightingProperties) do
+    for name in pairs(lightingOverrides) do
         local ok, value = pcall(function() return Lighting[name] end)
         if ok then lightingBefore[name] = value end
     end
     for _, obj in ipairs(Lighting:GetDescendants()) do
-        if obj:IsA("ColorCorrectionEffect") then
-            effectsBefore[obj] = {Enabled = obj.Enabled}
-        elseif obj:IsA("Atmosphere") then
-            effectsBefore[obj] = {
-                Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare
-            }
+        local props = effectOverrides[obj.ClassName]
+        if props then
+            local snapshot = {}
+            for name in pairs(props) do
+                local ok, value = pcall(function() return obj[name] end)
+                if ok then snapshot[name] = value end
+            end
+            effectsBefore[obj] = snapshot
         end
     end
 end
 
 local function applyFullbright()
-    if not S.Fullbright then return end
-    local overrides = {
-        ClockTime = 13,
-        Brightness = 3.5,
-        Ambient = Color3.fromRGB(255, 255, 255),
-        OutdoorAmbient = Color3.fromRGB(255, 255, 255),
-        ExposureCompensation = 0.35,
-        GlobalShadows = false,
-        FogStart = 0,
-        FogEnd = 1000000,
-        ColorShift_Top = Color3.new(0, 0, 0),
-        ColorShift_Bottom = Color3.new(0, 0, 0)
-    }
-    for name, value in pairs(overrides) do
-        pcall(function()
-            if Lighting[name] ~= value then Lighting[name] = value end
-        end)
+    if not S.Fullbright or not running then return end
+    for name in pairs(lightingOverrides) do
+        enforceLightingProperty(name)
     end
-    for _, obj in ipairs(Lighting:GetDescendants()) do
-        if obj:IsA("ColorCorrectionEffect") then
-            -- Some experiences darken nights with a color filter.
-            if effectsBefore and not effectsBefore[obj] then
-                effectsBefore[obj] = {Enabled = obj.Enabled}
-            end
-            if obj.Enabled then pcall(function() obj.Enabled = false end) end
-        elseif obj:IsA("Atmosphere") then
-            if effectsBefore and not effectsBefore[obj] then
-                effectsBefore[obj] = {
-                    Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare
-                }
-            end
-            pcall(function()
-                obj.Density = 0
-                obj.Haze = 0
-                obj.Glare = 0
-            end)
-        end
-    end
+    -- Effects are tracked with DescendantAdded and property signals; no
+    -- expensive GetDescendants() scan in the render loop.
 end
 
 local function restoreLighting()
+    -- Disconnect FIRST so our property listeners do not fight restoration.
+    disconnectFullbrightSignals()
     if lightingBefore then
         for name, value in pairs(lightingBefore) do
             pcall(function() Lighting[name] = value end)
@@ -136,12 +187,31 @@ end
 
 local function setFullbright(enabled)
     S.Fullbright = enabled
-    if enabled then
-        if not lightingBefore then captureLighting() end
-        applyFullbright()
-    else
+    if not enabled then
         restoreLighting()
+        return
     end
+    if not lightingBefore then captureLighting() end
+    disconnectFullbrightSignals()
+
+    -- Listen to the game's lighting updates and immediately enforce daytime.
+    for name in pairs(lightingOverrides) do
+        local ok, signal = pcall(function()
+            return Lighting:GetPropertyChangedSignal(name)
+        end)
+        if ok then
+            table.insert(fullbrightConnections, signal:Connect(function()
+                enforceLightingProperty(name)
+            end))
+        end
+    end
+    table.insert(fullbrightConnections, Lighting.DescendantAdded:Connect(function(obj)
+        trackEffect(obj)
+    end))
+    for _, obj in ipairs(Lighting:GetDescendants()) do
+        trackEffect(obj)
+    end
+    applyFullbright()
 end
 
 local function connect(signal, fn)
@@ -1147,7 +1217,6 @@ end
 
 local lastStatusUpdate = 0
 local lastESPWarn = 0
-local nextFullbrightUpdate = 0
 -- Run as late as possible in the camera pipeline. A recoil script may tilt
 -- the camera after the standard camera update; late head correction reduces
 -- the visible recoil kick. It cannot rewrite server-side shooting mechanics.
@@ -1162,8 +1231,7 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Last.Value + 10,funct
     circle.Visible=S.FOVVisible
 
     local now = os.clock()
-    if S.Fullbright and now >= nextFullbrightUpdate then
-        nextFullbrightUpdate = now + 0.15
+    if S.Fullbright then
         applyFullbright()
     end
     local refreshOkay, refreshError = pcall(refreshESP, now)
