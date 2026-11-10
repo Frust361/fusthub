@@ -1,4 +1,4 @@
--- FustHub - Whitelist + Aim NPC Filtering + X-Ray + Recoil + Fullbright + ESP + Bow
+-- FustHub - Performance Fix + X-Ray Restore + Whitelist + Aim + ESP + Bow
 -- Client-side Luau. Single file for Lynx/Delta-compatible executors.
 -- Client camera correction cannot guarantee the game/server bullet direction.
 -- Bow ballistics are estimates, not game/server hit registration.
@@ -29,7 +29,8 @@ local S = {
     Fullbright = false, -- locally force daytime lighting while enabled
     XRay = false, -- fade locally replicated base/map pieces
     XRayAlpha = 0.72, -- 0 = solid, 0.95 = almost invisible
-    XRayAll = false, -- false: anchored construction; true: all world geometry
+    XRayAll = false, -- false: construction; true: all nearby geometry
+    XRayRange = 200, -- only process construction near the player (studs)
     Part = "Head",
     Boxes = true, Names = true, Health = true, Highlight = true,
     ESPDistance = 1500,
@@ -59,142 +60,17 @@ local visuals = {}
 local running = true
 local renderName = "UnifiedAimRender"
 
--- STABLE FULLBRIGHT: watch Lighting writes rather than fighting them
--- on a 0.15-second interval. The game may update nighttime settings every
--- frame; change signals restore the desired values immediately. A late
--- render-frame check is a fallback for properties updated by other scripts.
-local lightingBefore = nil
-local effectsBefore = nil
-local fullbrightConnections = {}
-local trackedEffects = {}
-local fullbrightWriting = false
-
-local lightingOverrides = {
-    ClockTime = 13,
-    Brightness = 3.5,
-    Ambient = Color3.fromRGB(255, 255, 255),
-    OutdoorAmbient = Color3.fromRGB(255, 255, 255),
-    ExposureCompensation = 0.35,
-    GlobalShadows = false,
-    FogStart = 0,
-    FogEnd = 1000000,
-    ColorShift_Top = Color3.new(0, 0, 0),
-    ColorShift_Bottom = Color3.new(0, 0, 0)
-}
-
-local effectOverrides = {
-    ColorCorrectionEffect = {Enabled = false},
-    Atmosphere = {Density = 0, Haze = 0, Glare = 0}
-}
-
-local function disconnectFullbrightSignals()
-    for _, c in ipairs(fullbrightConnections) do
-        pcall(function() c:Disconnect() end)
-    end
-    table.clear(fullbrightConnections)
-    table.clear(trackedEffects)
-end
-
-local function setPropertyIfNeeded(obj, name, desired)
-    pcall(function()
-        if obj[name] ~= desired then
-            obj[name] = desired
-        end
-    end)
-end
-
-local function enforceLightingProperty(name)
-    if not S.Fullbright or not running or fullbrightWriting then return end
-    fullbrightWriting = true
-    setPropertyIfNeeded(Lighting, name, lightingOverrides[name])
-    fullbrightWriting = false
-end
-
-local function enforceEffect(obj)
-    if not S.Fullbright or not running or fullbrightWriting or not obj.Parent then
-        return
-    end
-    local props = effectOverrides[obj.ClassName]
-    if not props then return end
-    fullbrightWriting = true
-    for property, value in pairs(props) do
-        setPropertyIfNeeded(obj, property, value)
-    end
-    fullbrightWriting = false
-end
-
-local function trackEffect(obj)
-    local props = effectOverrides[obj.ClassName]
-    if not props or trackedEffects[obj] then return end
-    trackedEffects[obj] = true
-    if effectsBefore and not effectsBefore[obj] then
-        local snapshot = {}
-        for name in pairs(props) do
-            local ok, value = pcall(function() return obj[name] end)
-            if ok then snapshot[name] = value end
-        end
-        effectsBefore[obj] = snapshot
-    end
-    for name in pairs(props) do
-        local ok, signal = pcall(function()
-            return obj:GetPropertyChangedSignal(name)
-        end)
-        if ok then
-            table.insert(fullbrightConnections, signal:Connect(function()
-                enforceEffect(obj)
-            end))
-        end
-    end
-    enforceEffect(obj)
-end
-
-local function captureLighting()
-    lightingBefore = {}
-    effectsBefore = {}
-    for name in pairs(lightingOverrides) do
-        local ok, value = pcall(function() return Lighting[name] end)
-        if ok then lightingBefore[name] = value end
-    end
-    for _, obj in ipairs(Lighting:GetDescendants()) do
-        local props = effectOverrides[obj.ClassName]
-        if props then
-            local snapshot = {}
-            for name in pairs(props) do
-                local ok, value = pcall(function() return obj[name] end)
-                if ok then snapshot[name] = value end
-            end
-            effectsBefore[obj] = snapshot
-        end
-    end
-end
-
-local function applyFullbright()
-    if not S.Fullbright or not running then return end
-    for name in pairs(lightingOverrides) do
-        enforceLightingProperty(name)
-    end
-    -- Effects are tracked with DescendantAdded and property signals; no
-    -- expensive GetDescendants() scan in the render loop.
-end
-
+-- LIGHTWEIGHT FULLBRIGHT
+-- The previous version fought the game's day/night controller using 10 property
+-- listeners plus a per-frame rewrite. That can create expensive client-side churn.
+-- Instead, use ONE local ColorCorrectionEffect. It will not be as powerful as
+-- forcing ClockTime/GlobalShadows, but it is stable and does not fight scripts.
+local dayVisionEffect = nil
 local function restoreLighting()
-    -- Disconnect FIRST so our property listeners do not fight restoration.
-    disconnectFullbrightSignals()
-    if lightingBefore then
-        for name, value in pairs(lightingBefore) do
-            pcall(function() Lighting[name] = value end)
-        end
+    if dayVisionEffect then
+        pcall(function() dayVisionEffect:Destroy() end)
+        dayVisionEffect = nil
     end
-    if effectsBefore then
-        for obj, props in pairs(effectsBefore) do
-            if obj and obj.Parent then
-                for name, value in pairs(props) do
-                    pcall(function() obj[name] = value end)
-                end
-            end
-        end
-    end
-    lightingBefore, effectsBefore = nil, nil
 end
 
 local function setFullbright(enabled)
@@ -203,27 +79,17 @@ local function setFullbright(enabled)
         restoreLighting()
         return
     end
-    if not lightingBefore then captureLighting() end
-    disconnectFullbrightSignals()
-
-    -- Listen to the game's lighting updates and immediately enforce daytime.
-    for name in pairs(lightingOverrides) do
-        local ok, signal = pcall(function()
-            return Lighting:GetPropertyChangedSignal(name)
-        end)
-        if ok then
-            table.insert(fullbrightConnections, signal:Connect(function()
-                enforceLightingProperty(name)
-            end))
-        end
-    end
-    table.insert(fullbrightConnections, Lighting.DescendantAdded:Connect(function(obj)
-        trackEffect(obj)
-    end))
-    for _, obj in ipairs(Lighting:GetDescendants()) do
-        trackEffect(obj)
-    end
-    applyFullbright()
+    if dayVisionEffect and dayVisionEffect.Parent == Lighting then return end
+    restoreLighting()
+    local effect = Instance.new("ColorCorrectionEffect")
+    effect.Name = "FustHub_DayVision_Lite"
+    effect.Brightness = 0.42
+    effect.Contrast = -0.16
+    effect.Saturation = 0.03
+    effect.TintColor = Color3.fromRGB(255, 253, 248)
+    effect.Enabled = true
+    effect.Parent = Lighting
+    dayVisionEffect = effect
 end
 
 local function connect(signal, fn)
@@ -241,12 +107,19 @@ local function round(obj, px)
     create("UICorner", {CornerRadius = UDim.new(0, px)}, obj)
 end
 
--- X-RAY: CLIENT-SIDE BUILDING TRANSPARENCY
--- LocalTransparencyModifier only changes what this client renders.
--- It does not reveal objects that the game has not replicated to this client.
--- Existing local transparency is saved and restored when X-Ray is disabled.
-local xrayOriginal = setmetatable({}, {__mode = "k"})
+-- X-RAY PERFORMANCE MODE
+-- Scan only nearby parts using the engine's spatial query, not the entire
+-- Workspace:GetDescendants(). All edits are to local visual transparency.
+-- Only one scan is active at a time; it yields periodically to avoid freezes.
+-- Turning X-Ray OFF restores the saved value for EVERY changed part.
+local xrayOriginal = {}
 local xrayVersion = 0
+local xrayScanRunning = false
+local xrayRestoreJobs = 0
+local nextXrayScan = 0
+local scanXrayNearby -- forward declaration for restoring-then-scanning
+local XRAY_SCAN_INTERVAL = 1.5
+local XRAY_QUERY_LIMIT = 2200
 local structureWords = {
     "wall", "roof", "ceiling", "floor", "foundation", "build", "structure",
     "armored", "armour", "metal", "stone", "wood", "door", "frame",
@@ -262,9 +135,7 @@ local lootWords = {
 local function matchesName(name, words)
     local lowered = string.lower(name)
     for _, word in ipairs(words) do
-        if string.find(lowered, word, 1, true) then
-            return true
-        end
+        if string.find(lowered, word, 1, true) then return true end
     end
     return false
 end
@@ -276,10 +147,14 @@ local function xrayClassification(part)
     local camera = Workspace.CurrentCamera
     if camera and part:IsDescendantOf(camera) then return nil end
 
-    -- Never fade characters, NPCs, accessories or held tools.
+    -- Huge map/terrain slabs should not fade when BUILDINGS is selected.
+    if not S.XRayAll then
+        local size = part.Size
+        if size.X > 120 or size.Y > 120 or size.Z > 120 then return nil end
+    end
+
     local node = part
-    local structural = false
-    local storage = false
+    local structural, storage = false, false
     local depth = 0
     while node and node ~= Workspace and depth < 10 do
         if node:IsA("Tool") or node:IsA("Accessory") then return nil end
@@ -291,8 +166,6 @@ local function xrayClassification(part)
         node = node.Parent
         depth = depth + 1
     end
-
-    -- Keep cupboards, chests and other interior objects easy to identify.
     if storage then
         return S.XRayAll and math.min(0.14, S.XRayAlpha) or nil
     end
@@ -302,69 +175,133 @@ local function xrayClassification(part)
     return nil
 end
 
-local function fadeXrayPart(part)
-    if not running or not S.XRay then return end
-    local alpha = xrayClassification(part)
-    if alpha == nil then return end
-    if xrayOriginal[part] == nil then
-        local ok, original = pcall(function()
-            return part.LocalTransparencyModifier
-        end)
-        if not ok then return end
-        xrayOriginal[part] = original
-    end
+local function restoreXrayPart(part, original)
     pcall(function()
-        part.LocalTransparencyModifier = alpha
-    end)
-end
-
-local function restoreXray()
-    for part, original in pairs(xrayOriginal) do
-        pcall(function()
-            if part.Parent then part.LocalTransparencyModifier = original end
-        end)
-        xrayOriginal[part] = nil
-    end
-end
-
-local function scanXrayWorld()
-    xrayVersion = xrayVersion + 1
-    local thisScan = xrayVersion
-    task.spawn(function()
-        local descendants = Workspace:GetDescendants()
-        for index, obj in ipairs(descendants) do
-            if not running or not S.XRay or thisScan ~= xrayVersion then
-                return
-            end
-            if obj:IsA("BasePart") then fadeXrayPart(obj) end
-            -- Yield frequently so large maps don't lock the client.
-            if index % 250 == 0 then task.wait() end
+        if part and part.LocalTransparencyModifier ~= original then
+            part.LocalTransparencyModifier = original
         end
     end)
 end
 
-local function setXray(enabled)
+local function restoreXraySnapshot(snapshot)
+    local count = 0
+    for part, original in pairs(snapshot) do
+        restoreXrayPart(part, original)
+        count = count + 1
+        if count % 140 == 0 then task.wait() end
+    end
+end
+
+local function clearXrayAndRestore()
+    -- Stops unfinished scanner jobs before restoring; prevents transparent
+    -- objects from being written back immediately after switch-off.
     xrayVersion = xrayVersion + 1
-    restoreXray()
-    S.XRay = enabled
-    if enabled then scanXrayWorld() end
+    S.XRay = false
+    local snapshot = xrayOriginal
+    xrayOriginal = {}
+    -- Restore in batches; do not start a new scan until restoration completes.
+    if next(snapshot) ~= nil then
+        xrayRestoreJobs = xrayRestoreJobs + 1
+        task.spawn(function()
+            restoreXraySnapshot(snapshot)
+            xrayRestoreJobs = xrayRestoreJobs - 1
+            if xrayRestoreJobs == 0 and running and S.XRay then
+                scanXrayNearby()
+            end
+        end)
+    end
+end
+
+scanXrayNearby = function()
+    if not S.XRay or not running or xrayScanRunning or xrayRestoreJobs > 0 then return end
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local version = xrayVersion
+    xrayScanRunning = true
+    task.spawn(function()
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {character}
+        params.MaxParts = XRAY_QUERY_LIMIT
+        local ok, parts = pcall(function()
+            return Workspace:GetPartBoundsInRadius(root.Position, S.XRayRange, params)
+        end)
+        if not ok then
+            xrayScanRunning = false
+            return
+        end
+
+        local seen = {}
+        for index, part in ipairs(parts) do
+            if not running or not S.XRay or version ~= xrayVersion then
+                xrayScanRunning = false
+                return
+            end
+            local alpha = xrayClassification(part)
+            if alpha ~= nil then
+                seen[part] = true
+                if xrayOriginal[part] == nil then
+                    local saved, value = pcall(function()
+                        return part.LocalTransparencyModifier
+                    end)
+                    if saved then xrayOriginal[part] = value end
+                end
+                if xrayOriginal[part] ~= nil then
+                    pcall(function()
+                        if part.LocalTransparencyModifier ~= alpha then
+                            part.LocalTransparencyModifier = alpha
+                        end
+                    end)
+                end
+            end
+            if index % 75 == 0 then task.wait() end
+        end
+
+        -- When moving away from a base, restore pieces that leave the radius.
+        local n = 0
+        for part, original in pairs(xrayOriginal) do
+            if not running or not S.XRay or version ~= xrayVersion then
+                xrayScanRunning = false
+                return
+            end
+            if not seen[part] then
+                restoreXrayPart(part, original)
+                xrayOriginal[part] = nil
+            end
+            n = n + 1
+            if n % 100 == 0 then task.wait() end
+        end
+        xrayScanRunning = false
+    end)
+end
+
+local function setXray(enabled)
+    clearXrayAndRestore()
+    if enabled and running then
+        S.XRay = true
+        xrayVersion = xrayVersion + 1
+        nextXrayScan = os.clock() + XRAY_SCAN_INTERVAL
+        -- If restoration is in progress, its completion starts the next scan.
+        -- Otherwise scan immediately, with no arbitrary race-prone delay.
+        if xrayRestoreJobs == 0 then scanXrayNearby() end
+    end
 end
 
 local function updateXrayOpacity()
     if not S.XRay then return end
     for part in pairs(xrayOriginal) do
         local alpha = xrayClassification(part)
-        if alpha then
-            pcall(function() part.LocalTransparencyModifier = alpha end)
+        if alpha ~= nil then
+            pcall(function()
+                if part.LocalTransparencyModifier ~= alpha then
+                    part.LocalTransparencyModifier = alpha
+                end
+            end)
         end
     end
 end
-
--- Handle construction pieces streamed in or created after X-Ray is enabled.
-connect(Workspace.DescendantAdded, function(obj)
-    if not running or not S.XRay then return end
-    if obj:IsA("BasePart") then fadeXrayPart(obj) end
-end)
 
 local gui = create("ScreenGui", {
     Name="UnifiedAimESP", ResetOnSpawn=false, IgnoreGuiInset=true,
@@ -527,9 +464,10 @@ toggle("Anti-Recoil Head Magnet", "RecoilHeadLock")
 toggle("Fullbright (Day Vision)", "Fullbright")
 toggle("X-Ray (See Into Bases)", "XRay")
 adjust("X-Ray Transparency", "XRayAlpha", 0.25, 0.95, 0.05, "%.2f", updateXrayOpacity)
+adjust("X-Ray Range", "XRayRange", 75, 400, 25, "%.0f")
 button("X-Ray Scope: BUILDINGS", function(b)
     S.XRayAll = not S.XRayAll
-    b.Text = S.XRayAll and "X-Ray Scope: ALL MAP" or "X-Ray Scope: BUILDINGS"
+    b.Text = S.XRayAll and "X-Ray Scope: ALL NEARBY" or "X-Ray Scope: BUILDINGS"
     if S.XRay then setXray(true) end
 end)
 toggle("Target Players", "TargetPlayers")
@@ -1717,8 +1655,10 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Last.Value + 10,funct
         whitelistRefreshAt = now + 0.8
         refreshWhitelistUI()
     end
-    if S.Fullbright then
-        applyFullbright()
+    -- Fullbright is a single persistent effect now; no per-frame writes.
+    if S.XRay and now >= nextXrayScan then
+        nextXrayScan = now + XRAY_SCAN_INTERVAL
+        scanXrayNearby()
     end
     local refreshOkay, refreshError = pcall(refreshESP, now)
     if not refreshOkay then
@@ -1806,4 +1746,4 @@ _G.UnifiedAimCleanup=function()
     for model in pairs(visuals) do removeESP(model) end
     if gui then gui:Destroy() end
 end
-print("[FustHub] Whitelist + NPC filters + X-Ray + recoil + Fullbright + ESP + Bow loaded")
+print("[FustHub] Performance Mode: local X-Ray scans + Fullbright Lite + Aim/ESP/Bow loaded")
