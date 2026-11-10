@@ -1,4 +1,4 @@
--- FustHub - Recoil Head Lock + Fullbright + Reliable ESP + Bow
+-- FustHub - Whitelist + Aim NPC Filtering + X-Ray + Recoil + Fullbright + ESP + Bow
 -- Client-side Luau. Single file for Lynx/Delta-compatible executors.
 -- Client camera correction cannot guarantee the game/server bullet direction.
 -- Bow ballistics are estimates, not game/server hit registration.
@@ -21,11 +21,15 @@ if previous then previous:Destroy() end
 local S = {
     Aim = false, BowAim = false, ESP = true,
     TargetPlayers = true, TargetNPCs = true,
+    IgnoreWildlifeAndSleepers = true,
     FOVVisible = true, FOV = 160,
     Distance = 150, Smooth = 0.5, Prediction = 0,
     HeadPrecision = true, -- exact camera-to-head alignment in normal Aim mode
     RecoilHeadLock = true, -- keep the same visible head through recoil kicks
     Fullbright = false, -- locally force daytime lighting while enabled
+    XRay = false, -- fade locally replicated base/map pieces
+    XRayAlpha = 0.72, -- 0 = solid, 0.95 = almost invisible
+    XRayAll = false, -- false: anchored construction; true: all world geometry
     Part = "Head",
     Boxes = true, Names = true, Health = true, Highlight = true,
     ESPDistance = 1500,
@@ -41,6 +45,14 @@ local S = {
     BowMaxCorrection = 30, -- maximum correction above direct target angle
     BowKey = Enum.KeyCode.B
 }
+
+-- Whitelist is keyed by Roblox UserId and survives a script reload in the same executor session.
+-- It is NOT shared with the game server or saved to a remote database.
+local whitelist = _G.FustHubAimWhitelist
+if type(whitelist) ~= "table" then
+    whitelist = {}
+    _G.FustHubAimWhitelist = whitelist
+end
 
 local connections = {}
 local visuals = {}
@@ -229,9 +241,134 @@ local function round(obj, px)
     create("UICorner", {CornerRadius = UDim.new(0, px)}, obj)
 end
 
+-- X-RAY: CLIENT-SIDE BUILDING TRANSPARENCY
+-- LocalTransparencyModifier only changes what this client renders.
+-- It does not reveal objects that the game has not replicated to this client.
+-- Existing local transparency is saved and restored when X-Ray is disabled.
+local xrayOriginal = setmetatable({}, {__mode = "k"})
+local xrayVersion = 0
+local structureWords = {
+    "wall", "roof", "ceiling", "floor", "foundation", "build", "structure",
+    "armored", "armour", "metal", "stone", "wood", "door", "frame",
+    "triangle", "ramp", "pillar", "stair", "fence", "window",
+    "shutter", "garage", "hatch", "brick", "plank", "sheet", "panel"
+}
+local lootWords = {
+    "chest", "crate", "cupboard", "storage", "locker", "furnace",
+    "workbench", "loot", "barrel", "safe", "generator", "shelf",
+    "cabinet", "turret", "sentry", "stash", "storagebox", "woodenbox"
+}
+
+local function matchesName(name, words)
+    local lowered = string.lower(name)
+    for _, word in ipairs(words) do
+        if string.find(lowered, word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function xrayClassification(part)
+    if not part:IsA("BasePart") or not part:IsDescendantOf(Workspace) then
+        return nil
+    end
+    local camera = Workspace.CurrentCamera
+    if camera and part:IsDescendantOf(camera) then return nil end
+
+    -- Never fade characters, NPCs, accessories or held tools.
+    local node = part
+    local structural = false
+    local storage = false
+    local depth = 0
+    while node and node ~= Workspace and depth < 10 do
+        if node:IsA("Tool") or node:IsA("Accessory") then return nil end
+        if node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
+            return nil
+        end
+        if depth <= 3 and matchesName(node.Name, lootWords) then storage = true end
+        if matchesName(node.Name, structureWords) then structural = true end
+        node = node.Parent
+        depth = depth + 1
+    end
+
+    -- Keep cupboards, chests and other interior objects easy to identify.
+    if storage then
+        return S.XRayAll and math.min(0.14, S.XRayAlpha) or nil
+    end
+    if S.XRayAll or part.Anchored or structural then
+        return S.XRayAlpha
+    end
+    return nil
+end
+
+local function fadeXrayPart(part)
+    if not running or not S.XRay then return end
+    local alpha = xrayClassification(part)
+    if alpha == nil then return end
+    if xrayOriginal[part] == nil then
+        local ok, original = pcall(function()
+            return part.LocalTransparencyModifier
+        end)
+        if not ok then return end
+        xrayOriginal[part] = original
+    end
+    pcall(function()
+        part.LocalTransparencyModifier = alpha
+    end)
+end
+
+local function restoreXray()
+    for part, original in pairs(xrayOriginal) do
+        pcall(function()
+            if part.Parent then part.LocalTransparencyModifier = original end
+        end)
+        xrayOriginal[part] = nil
+    end
+end
+
+local function scanXrayWorld()
+    xrayVersion = xrayVersion + 1
+    local thisScan = xrayVersion
+    task.spawn(function()
+        local descendants = Workspace:GetDescendants()
+        for index, obj in ipairs(descendants) do
+            if not running or not S.XRay or thisScan ~= xrayVersion then
+                return
+            end
+            if obj:IsA("BasePart") then fadeXrayPart(obj) end
+            -- Yield frequently so large maps don't lock the client.
+            if index % 250 == 0 then task.wait() end
+        end
+    end)
+end
+
+local function setXray(enabled)
+    xrayVersion = xrayVersion + 1
+    restoreXray()
+    S.XRay = enabled
+    if enabled then scanXrayWorld() end
+end
+
+local function updateXrayOpacity()
+    if not S.XRay then return end
+    for part in pairs(xrayOriginal) do
+        local alpha = xrayClassification(part)
+        if alpha then
+            pcall(function() part.LocalTransparencyModifier = alpha end)
+        end
+    end
+end
+
+-- Handle construction pieces streamed in or created after X-Ray is enabled.
+connect(Workspace.DescendantAdded, function(obj)
+    if not running or not S.XRay then return end
+    if obj:IsA("BasePart") then fadeXrayPart(obj) end
+end)
+
 local gui = create("ScreenGui", {
     Name="UnifiedAimESP", ResetOnSpawn=false, IgnoreGuiInset=true,
-    DisplayOrder=100
+    ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=100
 }, PlayerGui)
 -- Compact draggable menu; the UIScale shrinks all controls proportionally.
 local menuWidth, menuHeight = 310, 500
@@ -292,8 +429,10 @@ create("UIListLayout", {
     Padding=UDim.new(0,7), SortOrder=Enum.SortOrder.LayoutOrder
 }, scroll)
 
+local closeWhitelistUI = function() end
 local collapsed = false
 connect(minimize.MouseButton1Click, function()
+    closeWhitelistUI()
     collapsed = not collapsed
     scroll.Visible = not collapsed
     panel.Size = collapsed and UDim2.fromOffset(165,46)
@@ -333,12 +472,13 @@ local function toggle(label, key)
         update()
         if key == "BowAim" then refreshBowUI() end
         if key == "Fullbright" then setFullbright(S.Fullbright) end
+        if key == "XRay" then setXray(S.XRay) end
     end)
     update()
     return update
 end
 
-local function adjust(label, key, minimum, maximum, step, format)
+local function adjust(label, key, minimum, maximum, step, format, onChange)
     local row = create("Frame", {
         Size=UDim2.new(1,-6,0,38), BackgroundTransparency=1
     }, scroll)
@@ -364,6 +504,7 @@ local function adjust(label, key, minimum, maximum, step, format)
         connect(b.MouseButton1Click, function()
             local delta = minus and -step or step
             S[key] = math.clamp(S[key] + delta, minimum, maximum)
+            if onChange then onChange() end
             update()
         end)
     end
@@ -384,8 +525,296 @@ adjust("Prediction", "Prediction", 0, 0.5, 0.025, "%.3f")
 toggle("Precise Head Lock", "HeadPrecision")
 toggle("Anti-Recoil Head Magnet", "RecoilHeadLock")
 toggle("Fullbright (Day Vision)", "Fullbright")
+toggle("X-Ray (See Into Bases)", "XRay")
+adjust("X-Ray Transparency", "XRayAlpha", 0.25, 0.95, 0.05, "%.2f", updateXrayOpacity)
+button("X-Ray Scope: BUILDINGS", function(b)
+    S.XRayAll = not S.XRayAll
+    b.Text = S.XRayAll and "X-Ray Scope: ALL MAP" or "X-Ray Scope: BUILDINGS"
+    if S.XRay then setXray(true) end
+end)
 toggle("Target Players", "TargetPlayers")
 toggle("Target NPCs", "TargetNPCs")
+toggle("Ignore Wildlife / Sleepers", "IgnoreWildlifeAndSleepers")
+
+-- AIM WHITELIST (players are excluded from both normal Aim Assist and Bow Aim)
+-- 30m uses Roblox's approximate 0.28m per stud conversion, so 107 studs.
+local NEARBY_WHITELIST_STUDS = 107
+local selectedWhitelist = {}
+local whitelistNearbyOnly = false
+local whitelistRefreshAt = 0
+local whitelistButton
+
+local function whitelistCount()
+    local count = 0
+    for _, enabled in pairs(whitelist) do
+        if enabled then count = count + 1 end
+    end
+    return count
+end
+
+local function updateWhitelistButton()
+    if whitelistButton then
+        whitelistButton.Text = string.format("Whitelist: %d players | OPEN", whitelistCount())
+    end
+end
+
+local modal = create("Frame", {
+    Name = "AimWhitelistMenu",
+    Size = UDim2.new(1, -14, 1, -58),
+    Position = UDim2.fromOffset(7, 51),
+    BackgroundColor3 = Color3.fromRGB(25, 30, 44),
+    BorderSizePixel = 0,
+    Active = true, Visible = false, ClipsDescendants = true,
+    ZIndex = 50
+}, panel)
+round(modal, 10)
+create("UIStroke", {
+    Color = Color3.fromRGB(93, 113, 147), Thickness = 1
+}, modal)
+
+local modalTitle = create("TextLabel", {
+    Position = UDim2.fromOffset(9, 6),
+    Size = UDim2.new(1, -50, 0, 30),
+    BackgroundTransparency = 1,
+    Text = "AIM WHITELIST", TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = Color3.fromRGB(244, 247, 255),
+    Font = Enum.Font.GothamBold, TextSize = 14, ZIndex = 51
+}, modal)
+
+local closeWL = create("TextButton", {
+    Position = UDim2.new(1, -39, 0, 6),
+    Size = UDim2.fromOffset(30, 30),
+    BackgroundColor3 = Color3.fromRGB(73, 48, 61),
+    Text = "X", TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold, TextSize = 15, ZIndex = 51
+}, modal)
+round(closeWL, 6)
+
+local searchWL = create("TextBox", {
+    Name = "PlayerSearch",
+    Position = UDim2.fromOffset(9, 44),
+    Size = UDim2.new(1, -18, 0, 34),
+    BackgroundColor3 = Color3.fromRGB(42, 49, 69),
+    ClearTextOnFocus = false, Text = "", PlaceholderText = "Search nickname / @username...",
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = Color3.new(1, 1, 1),
+    PlaceholderColor3 = Color3.fromRGB(170, 179, 197),
+    Font = Enum.Font.Gotham, TextSize = 12, ZIndex = 51
+}, modal)
+round(searchWL, 6)
+create("UIPadding", {PaddingLeft = UDim.new(0, 10)}, searchWL)
+
+local scopeWL = create("TextButton", {
+    Position = UDim2.fromOffset(9, 86),
+    Size = UDim2.new(1, -18, 0, 32),
+    BackgroundColor3 = Color3.fromRGB(49, 63, 85),
+    Text = "Filter: ALL SERVER PLAYERS",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamMedium, TextSize = 12, ZIndex = 51
+}, modal)
+round(scopeWL, 6)
+
+local playerList = create("ScrollingFrame", {
+    Name = "WhitelistPlayers",
+    Position = UDim2.fromOffset(9, 125),
+    Size = UDim2.new(1, -18, 1, -258),
+    BackgroundColor3 = Color3.fromRGB(31, 36, 53),
+    BorderSizePixel = 0, ScrollBarThickness = 4,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ZIndex = 51
+}, modal)
+round(playerList, 6)
+create("UIListLayout", {
+    Padding = UDim.new(0, 5),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, playerList)
+create("UIPadding", {
+    PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5),
+    PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5)
+}, playerList)
+
+local whitelistInfo = create("TextLabel", {
+    Position = UDim2.new(0, 9, 1, -124),
+    Size = UDim2.new(1, -18, 0, 26),
+    BackgroundTransparency = 1,
+    Text = "Select players to exclude from aiming",
+    TextColor3 = Color3.fromRGB(183, 200, 224),
+    Font = Enum.Font.Gotham, TextSize = 11,
+    TextWrapped = true, ZIndex = 51
+}, modal)
+
+local addSelectedWL = create("TextButton", {
+    Position = UDim2.new(0, 9, 1, -94),
+    Size = UDim2.new(1, -18, 0, 35),
+    BackgroundColor3 = Color3.fromRGB(32, 119, 95),
+    Text = "ADD SELECTED (0)",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold, TextSize = 12, ZIndex = 51
+}, modal)
+round(addSelectedWL, 6)
+
+local clearSelectionWL = create("TextButton", {
+    Position = UDim2.new(0, 9, 1, -52),
+    Size = UDim2.new(1, -18, 0, 35),
+    BackgroundColor3 = Color3.fromRGB(58, 64, 85),
+    Text = "CLEAR SELECTION (not whitelist)",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamMedium, TextSize = 11, ZIndex = 51
+}, modal)
+round(clearSelectionWL, 6)
+
+local function characterPosition(player)
+    local character = player.Character
+    if not character or not character:IsDescendantOf(Workspace) then return nil end
+    local part = character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Head")
+        or character.PrimaryPart
+    return part and part.Position or nil
+end
+
+local refreshWhitelistUI
+refreshWhitelistUI = function()
+    if not modal.Visible or not running then return end
+
+    local playerScroll = playerList.CanvasPosition
+    for _, child in ipairs(playerList:GetChildren()) do
+        if child:IsA("TextButton") or child:IsA("TextLabel") then
+            child:Destroy() -- destroys old click connections too
+        end
+    end
+
+    local ownPosition = characterPosition(LocalPlayer)
+    local searchText = string.lower(searchWL.Text):gsub("^%s+", ""):gsub("%s+$", "")
+    local matches = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local playerPosition = characterPosition(player)
+            local distance = ownPosition and playerPosition
+                and (playerPosition - ownPosition).Magnitude or nil
+            local inRange = distance and distance <= NEARBY_WHITELIST_STUDS
+            local nickname = string.lower(player.Name .. " " .. player.DisplayName)
+            if (not whitelistNearbyOnly or inRange)
+                and (searchText == "" or string.find(nickname, searchText, 1, true)) then
+                table.insert(matches, {Player = player, Distance = distance})
+            end
+        end
+    end
+    table.sort(matches, function(a, b)
+        if whitelistNearbyOnly then
+            return (a.Distance or math.huge) < (b.Distance or math.huge)
+        end
+        return string.lower(a.Player.Name) < string.lower(b.Player.Name)
+    end)
+
+    for index, entry in ipairs(matches) do
+        local player = entry.Player
+        local id = player.UserId
+        local isSaved = whitelist[id] == true
+        local isSelected = selectedWhitelist[id] == true
+        local prefix = isSaved and "[WHITELIST] "
+            or (isSelected and "[SELECTED] " or "[ ] ")
+        local distanceLabel = entry.Distance
+            and (" | " .. math.floor(entry.Distance / 3.5714 + 0.5) .. "m")
+            or " | no character"
+        local item = create("TextButton", {
+            LayoutOrder = index,
+            Size = UDim2.new(1, -2, 0, 39),
+            BackgroundColor3 = isSaved and Color3.fromRGB(32, 109, 83)
+                or (isSelected and Color3.fromRGB(53, 87, 135)
+                or Color3.fromRGB(50, 57, 76)),
+            Text = prefix .. player.DisplayName .. " (@" .. player.Name .. ")" .. distanceLabel,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = Color3.new(1, 1, 1),
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11, ZIndex = 52
+        }, playerList)
+        round(item, 6)
+        create("UIPadding", {PaddingLeft = UDim.new(0, 8)}, item)
+        item.MouseButton1Click:Connect(function()
+            if whitelist[id] then
+                -- Tap a green row to REMOVE this player from the whitelist.
+                whitelist[id] = nil
+            else
+                selectedWhitelist[id] = not selectedWhitelist[id] or nil
+            end
+            refreshWhitelistUI()
+            updateWhitelistButton()
+        end)
+    end
+
+    if #matches == 0 then
+        create("TextLabel", {
+            Size = UDim2.new(1, -2, 0, 58),
+            BackgroundTransparency = 1,
+            Text = whitelistNearbyOnly
+                and "No server players within about 30m"
+                or "No players match the search",
+            TextColor3 = Color3.fromRGB(190, 201, 220),
+            TextWrapped = true,
+            Font = Enum.Font.Gotham, TextSize = 12,
+            ZIndex = 52
+        }, playerList)
+    end
+    playerList.CanvasPosition = playerScroll
+
+    local selectedCount = 0
+    for id, yes in pairs(selectedWhitelist) do
+        if yes and not whitelist[id] then selectedCount = selectedCount + 1 end
+    end
+    addSelectedWL.Text = string.format("ADD SELECTED (%d)", selectedCount)
+    whitelistInfo.Text = string.format(
+        "%d listed | %d whitelisted | tap green to remove", #matches, whitelistCount())
+    updateWhitelistButton()
+end
+
+closeWhitelistUI = function()
+    modal.Visible = false
+end
+
+whitelistButton = button("Whitelist: 0 players | OPEN", function()
+    modal.Visible = not modal.Visible
+    if modal.Visible then
+        whitelistRefreshAt = 0
+        refreshWhitelistUI()
+    end
+end)
+updateWhitelistButton()
+
+connect(closeWL.MouseButton1Click, closeWhitelistUI)
+connect(scopeWL.MouseButton1Click, function()
+    whitelistNearbyOnly = not whitelistNearbyOnly
+    scopeWL.Text = whitelistNearbyOnly
+        and "Filter: NEARBY (30m / ~107 studs)"
+        or "Filter: ALL SERVER PLAYERS"
+    playerList.CanvasPosition = Vector2.new(0, 0)
+    refreshWhitelistUI()
+end)
+connect(searchWL:GetPropertyChangedSignal("Text"), function()
+    playerList.CanvasPosition = Vector2.new(0, 0)
+    refreshWhitelistUI()
+end)
+connect(addSelectedWL.MouseButton1Click, function()
+    for id, yes in pairs(selectedWhitelist) do
+        if yes then whitelist[id] = true end
+        selectedWhitelist[id] = nil
+    end
+    refreshWhitelistUI()
+end)
+connect(clearSelectionWL.MouseButton1Click, function()
+    table.clear(selectedWhitelist)
+    refreshWhitelistUI()
+end)
+connect(Players.PlayerAdded, function()
+    if modal.Visible then refreshWhitelistUI() end
+end)
+connect(Players.PlayerRemoving, function(player)
+    selectedWhitelist[player.UserId] = nil
+    if modal.Visible then task.defer(refreshWhitelistUI) end
+end)
 
 -- BOW controls
 local updateBowToggle = toggle("Bow Aimbot", "BowAim")
@@ -671,14 +1100,66 @@ local function getNPCs()
     end
     return npcModels
 end
+-- Always check exclusion on TARGET SELECTION, not just the UI.
+-- This makes the whitelist apply to bow and normal aim, including sticky head lock.
+local ignoredNpcNames = {"deer", "boar", "bear", "sleeper"}
+local function npcIsIgnored(model)
+    if not S.IgnoreWildlifeAndSleepers then return false end
+    local node = model
+    -- Check the rig's name and its nearest containers, e.g. Sleeper_12345.
+    for _ = 1, 3 do
+        if not node or node == Workspace then break end
+        local cleaned = string.lower(node.Name):gsub("[^%w]", "")
+        for _, keyword in ipairs(ignoredNpcNames) do
+            if string.find(cleaned, keyword, 1, true) then
+                return true
+            end
+        end
+        node = node.Parent
+    end
+    -- Some rigs have generic numeric model names but a recognizable Humanoid DisplayName.
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        local display = string.lower(tostring(humanoid.DisplayName))
+        for _, keyword in ipairs(ignoredNpcNames) do
+            if string.find(display, keyword, 1, true) then return true end
+        end
+    end
+    -- Some games label NPC types in attributes instead of model names.
+    for _, attribute in ipairs({"NPCType", "MobType", "EntityType"}) do
+        local raw = model:GetAttribute(attribute)
+        if type(raw) == "string" then
+            local lowered = string.lower(raw)
+            for _, keyword in ipairs(ignoredNpcNames) do
+                if string.find(lowered, keyword, 1, true) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function isAimExcluded(model)
+    local player = playerForAncestor(model)
+    if player then
+        return player == LocalPlayer or whitelist[player.UserId] == true
+    end
+    return npcIsIgnored(model)
+end
+
 local function eachTarget(callback)
     if S.TargetPlayers then
         for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer and p.Character then callback(p.Character) end
+            if p ~= LocalPlayer and p.Character and not whitelist[p.UserId] then
+                callback(p.Character)
+            end
         end
     end
     if S.TargetNPCs then
-        for _, model in ipairs(getNPCs()) do callback(model) end
+        for _, model in ipairs(getNPCs()) do
+            if not isAimExcluded(model) then callback(model) end
+        end
     end
 end
 
@@ -726,6 +1207,7 @@ local function getStickyHead(camera)
             and head:IsDescendantOf(model)
             and humanoid and humanoid.Health > 0
             and enabled
+            and not isAimExcluded(model)
             and (head.Position - camera.CFrame.Position).Magnitude <= S.Distance
             and canSee(model, head.Position, camera)
         if valid then return head, model end
@@ -1231,6 +1713,10 @@ RunService:BindToRenderStep(renderName,Enum.RenderPriority.Last.Value + 10,funct
     circle.Visible=S.FOVVisible
 
     local now = os.clock()
+    if modal.Visible and now >= whitelistRefreshAt then
+        whitelistRefreshAt = now + 0.8
+        refreshWhitelistUI()
+    end
     if S.Fullbright then
         applyFullbright()
     end
@@ -1312,6 +1798,7 @@ end)
 _G.UnifiedAimCleanup=function()
     running=false
     clearHeadLock()
+    setXray(false)
     S.Fullbright = false
     restoreLighting()
     pcall(function() RunService:UnbindFromRenderStep(renderName) end)
@@ -1319,4 +1806,4 @@ _G.UnifiedAimCleanup=function()
     for model in pairs(visuals) do removeESP(model) end
     if gui then gui:Destroy() end
 end
-print("[FustHub] Recoil head magnet + Fullbright + Reliable ESP + Bow loaded")
+print("[FustHub] Whitelist + NPC filters + X-Ray + recoil + Fullbright + ESP + Bow loaded")
