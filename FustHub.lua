@@ -1,4 +1,4 @@
--- FustHub - Performance Fix + X-Ray Restore + Whitelist + Aim + ESP + Bow
+-- FustHub - Adjustable Fullbright + Performance X-Ray + Whitelist + Aim + ESP + Bow
 -- Client-side Luau. Single file for Lynx/Delta-compatible executors.
 -- Client camera correction cannot guarantee the game/server bullet direction.
 -- Bow ballistics are estimates, not game/server hit registration.
@@ -26,7 +26,8 @@ local S = {
     Distance = 150, Smooth = 0.5, Prediction = 0,
     HeadPrecision = true, -- exact camera-to-head alignment in normal Aim mode
     RecoilHeadLock = true, -- keep the same visible head through recoil kicks
-    Fullbright = false, -- locally force daytime lighting while enabled
+    Fullbright = false, -- local night vision
+    FullbrightBrightness = 0.14, -- adjustable: 0.00 (subtle) to 0.30 (bright)
     XRay = false, -- fade locally replicated base/map pieces
     XRayAlpha = 0.72, -- 0 = solid, 0.95 = almost invisible
     XRayAll = false, -- false: construction; true: all nearby geometry
@@ -60,11 +61,9 @@ local visuals = {}
 local running = true
 local renderName = "UnifiedAimRender"
 
--- LIGHTWEIGHT FULLBRIGHT
--- The previous version fought the game's day/night controller using 10 property
--- listeners plus a per-frame rewrite. That can create expensive client-side churn.
--- Instead, use ONE local ColorCorrectionEffect. It will not be as powerful as
--- forcing ClockTime/GlobalShadows, but it is stable and does not fight scripts.
+-- LIGHTWEIGHT, ADJUSTABLE FULLBRIGHT
+-- A single local ColorCorrectionEffect. No per-frame Lighting writes.
+-- Keep it persistent and adjust its intensity only when the user changes it.
 local dayVisionEffect = nil
 local function restoreLighting()
     if dayVisionEffect then
@@ -73,23 +72,28 @@ local function restoreLighting()
     end
 end
 
+local function updateFullbrightBrightness()
+    if not S.Fullbright then return end
+    if not dayVisionEffect or dayVisionEffect.Parent ~= Lighting then
+        restoreLighting()
+        dayVisionEffect = Instance.new("ColorCorrectionEffect")
+        dayVisionEffect.Name = "FustHub_DayVision_Lite"
+        dayVisionEffect.Parent = Lighting
+    end
+    dayVisionEffect.Brightness = math.clamp(S.FullbrightBrightness, 0, 0.30)
+    dayVisionEffect.Contrast = -0.045
+    dayVisionEffect.Saturation = 0
+    dayVisionEffect.TintColor = Color3.fromRGB(255, 255, 255)
+    dayVisionEffect.Enabled = true
+end
+
 local function setFullbright(enabled)
     S.Fullbright = enabled
     if not enabled then
         restoreLighting()
         return
     end
-    if dayVisionEffect and dayVisionEffect.Parent == Lighting then return end
-    restoreLighting()
-    local effect = Instance.new("ColorCorrectionEffect")
-    effect.Name = "FustHub_DayVision_Lite"
-    effect.Brightness = 0.42
-    effect.Contrast = -0.16
-    effect.Saturation = 0.03
-    effect.TintColor = Color3.fromRGB(255, 253, 248)
-    effect.Enabled = true
-    effect.Parent = Lighting
-    dayVisionEffect = effect
+    updateFullbrightBrightness()
 end
 
 local function connect(signal, fn)
@@ -462,6 +466,7 @@ adjust("Prediction", "Prediction", 0, 0.5, 0.025, "%.3f")
 toggle("Precise Head Lock", "HeadPrecision")
 toggle("Anti-Recoil Head Magnet", "RecoilHeadLock")
 toggle("Fullbright (Day Vision)", "Fullbright")
+adjust("Day Vision Brightness", "FullbrightBrightness", 0, 0.30, 0.025, "%.3f", updateFullbrightBrightness)
 toggle("X-Ray (See Into Bases)", "XRay")
 adjust("X-Ray Transparency", "XRayAlpha", 0.25, 0.95, 0.05, "%.2f", updateXrayOpacity)
 adjust("X-Ray Range", "XRayRange", 75, 400, 25, "%.0f")
@@ -1746,4 +1751,4 @@ _G.UnifiedAimCleanup=function()
     for model in pairs(visuals) do removeESP(model) end
     if gui then gui:Destroy() end
 end
-print("[FustHub] Performance Mode: local X-Ray scans + Fullbright Lite + Aim/ESP/Bow loaded")
+print("[FustHub] Performance Mode: adjustable Fullbright + X-Ray + Aim/ESP/Bow loaded")
